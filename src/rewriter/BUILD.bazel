@@ -36,6 +36,7 @@ load(
     "mozc_cc_library",
     "mozc_cc_test",
     "mozc_py_binary",
+    "mozc_select",
     "mozc_select_enable_usage_rewriter",
 )
 
@@ -1512,6 +1513,21 @@ mozc_cc_test(
 )
 
 mozc_cc_library(
+    name = "neural_rerank_rewriter",
+    srcs = ["neural_rerank_rewriter.cc"],
+    hdrs = ["neural_rerank_rewriter.h"],
+    deps = [
+        ":rewriter_interface",
+        "//base:util",
+        "//converter:segments",
+        "//protocol:commands_cc_proto",
+        "//request:conversion_request",
+        "@com_google_absl//absl/strings",
+    ] + mozc_select(windows = ["//bazel/win32:ws2_32"]),
+    alwayslink = 1,
+)
+
+mozc_cc_library(
     name = "rewriter",
     srcs = [
         "rewriter.cc",
@@ -1538,6 +1554,7 @@ mozc_cc_library(
         ":ivs_variants_rewriter",
         ":language_aware_rewriter",
         ":merger_rewriter",
+        ":neural_rerank_rewriter",
         ":number_rewriter",
         ":remove_redundant_candidate_rewriter",
         ":single_kanji_rewriter",

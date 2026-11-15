@@ -4,7 +4,7 @@ name: ime-rerank Windows x64 build
 # Run on push.
 on:
   push:
-    branches: [ime-rerank]
+    branches: [ime-rerank, ime-rerank-dev]
   workflow_dispatch:
 
 permissions:

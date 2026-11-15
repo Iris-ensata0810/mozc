@@ -51,6 +51,7 @@
 #include "rewriter/focus_candidate_rewriter.h"
 #include "rewriter/ivs_variants_rewriter.h"
 #include "rewriter/language_aware_rewriter.h"
+#include "rewriter/neural_rerank_rewriter.h"
 #include "rewriter/number_rewriter.h"
 #include "rewriter/remove_redundant_candidate_rewriter.h"
 #include "rewriter/single_kanji_rewriter.h"
@@ -160,6 +161,9 @@ Rewriter::Rewriter(const engine::Modules& modules) {
   AddRewriter(make_unique_from_tuples<SymbolRewriter>(
       data_manager.GetSymbolRewriterData()));
   AddRewriter(std::make_unique<UnicodeRewriter>());
+  // Context-aware reordering by a local neural reranker (personal experiment).
+  // Placed before the user history rewriters so that user learning wins.
+  AddRewriter(std::make_unique<NeuralRerankRewriter>());
   if (absl::GetFlag(FLAGS_use_history_rewriter)) {
     AddRewriter(
         std::make_unique<UserSegmentHistoryRewriter>(pos_matcher, pos_group));
