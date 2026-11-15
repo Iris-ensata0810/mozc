@@ -39,6 +39,11 @@ class RerankBackend {
     std::string key;                  // reading of the segment
     std::vector<std::string> values;  // candidates in Mozc order
     std::vector<int32_t> costs;       // Mozc costs, same length as values
+    // Client-side statistics of earlier exchanges (sent for diagnosis).
+    int stat_count = 0;
+    int stat_timeouts = 0;
+    int stat_last_ms = 0;
+    int stat_max_ms = 0;
   };
 
   virtual ~RerankBackend() = default;
@@ -64,6 +69,10 @@ class LocalServerRerankBackend : public RerankBackend {
   int timeout_ms_;
   int backoff_ms_;
   mutable int64_t next_try_ms_ = 0;  // monotonic ms; 0 = try now
+  mutable int stat_count_ = 0;
+  mutable int stat_timeouts_ = 0;
+  mutable int stat_last_ms_ = 0;
+  mutable int stat_max_ms_ = 0;
 };
 
 class NeuralRerankRewriter : public RewriterInterface {
@@ -81,6 +90,9 @@ class NeuralRerankRewriter : public RewriterInterface {
 
   // Exposed for tests: last |max_chars| Unicode characters of |text|.
   static std::string LastChars(absl::string_view text, size_t max_chars);
+  // Exposed for tests: |preceding| without the trailing composition |key|.
+  static std::string StripComposition(absl::string_view preceding,
+                                      absl::string_view key);
 
  private:
   std::string BuildContext(const ConversionRequest& request,

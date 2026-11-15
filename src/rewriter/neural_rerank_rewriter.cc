@@ -289,7 +289,14 @@ std::string LocalServerRerankBackend::BuildRequest(const Query& query) {
     if (i > 0) out.push_back(',');
     out.append(std::to_string(query.costs[i]));
   }
-  out.append("]}\n");
+  out.append("]");
+  if (query.stat_count > 0) {
+    out.append(",\"stat\":{\"n\":" + std::to_string(query.stat_count) +
+               ",\"timeouts\":" + std::to_string(query.stat_timeouts) +
+               ",\"last_ms\":" + std::to_string(query.stat_last_ms) +
+               ",\"max_ms\":" + std::to_string(query.stat_max_ms) + "}");
+  }
+  out.append("}\n");
   return out;
 }
 
@@ -323,8 +330,20 @@ std::optional<std::vector<int>> LocalServerRerankBackend::Rerank(
   if (now < next_try_ms_) {
     return std::nullopt;  // backing off after a recent failure
   }
+  Query q = query;
+  q.stat_count = stat_count_;
+  q.stat_timeouts = stat_timeouts_;
+  q.stat_last_ms = stat_last_ms_;
+  q.stat_max_ms = stat_max_ms_;
   std::optional<std::string> line =
-      Exchange(port_, BuildRequest(query), now + timeout_ms_);
+      Exchange(port_, BuildRequest(q), now + timeout_ms_);
+  const int elapsed = static_cast<int>(NowMs() - now);
+  ++stat_count_;
+  stat_last_ms_ = elapsed;
+  stat_max_ms_ = (std::max)(stat_max_ms_, elapsed);
+  if (!line.has_value()) {
+    ++stat_timeouts_;
+  }
   std::optional<std::vector<int>> order;
   if (line.has_value()) {
     order = ParseResponse(*line, query.values.size());
@@ -379,10 +398,80 @@ std::string NeuralRerankRewriter::LastChars(absl::string_view text,
   return std::string(text.substr(pos));
 }
 
+namespace {
+
+// Decodes UTF-8 into code points (invalid bytes become U+FFFD).
+std::vector<char32_t> DecodeUtf8(absl::string_view s) {
+  std::vector<char32_t> out;
+  size_t i = 0;
+  while (i < s.size()) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    int len = 1;
+    char32_t cp = 0xFFFD;
+    if (c < 0x80) {
+      cp = c;
+    } else if ((c >> 5) == 0x6 && i + 1 < s.size()) {
+      len = 2;
+      cp = ((c & 0x1F) << 6) | (s[i + 1] & 0x3F);
+    } else if ((c >> 4) == 0xE && i + 2 < s.size()) {
+      len = 3;
+      cp = ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+    } else if ((c >> 3) == 0x1E && i + 3 < s.size()) {
+      len = 4;
+      cp = ((c & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12) |
+           ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+    }
+    out.push_back(cp);
+    i += len;
+  }
+  return out;
+}
+
+bool IsLatinLetter(char32_t c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= 0xFF41 && c <= 0xFF5A) || (c >= 0xFF21 && c <= 0xFF3A) ||
+         c == '\'' || c == 0xFF07;
+}
+
+}  // namespace
+
+std::string NeuralRerankRewriter::StripComposition(absl::string_view preceding,
+                                                   absl::string_view key) {
+  // On Windows the "text before the cursor" includes the composition being
+  // converted (e.g. "...きょう" or "...こｎ" while romaji is pending). Remove
+  // it when the tail matches the reading, allowing pending romaji letters.
+  if (key.empty()) {
+    return std::string(preceding);
+  }
+  const std::vector<char32_t> p = DecodeUtf8(preceding);
+  const std::vector<char32_t> k = DecodeUtf8(key);
+  if (p.size() < k.size()) {
+    return std::string(preceding);
+  }
+  const size_t start = p.size() - k.size();
+  for (size_t i = 0; i < k.size(); ++i) {
+    if (p[start + i] != k[i] && !IsLatinLetter(p[start + i])) {
+      return std::string(preceding);  // not the composition; keep as is
+    }
+  }
+  // Byte offset of code point |start|.
+  size_t byte = 0;
+  for (size_t n = 0; n < start; ++n) {
+    const unsigned char c = static_cast<unsigned char>(preceding[byte]);
+    byte += c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : 4;
+  }
+  return std::string(preceding.substr(0, (std::min)(byte, preceding.size())));
+}
+
 std::string NeuralRerankRewriter::BuildContext(const ConversionRequest& request,
                                                const Segments& segments) const {
+  std::string key;
+  for (const Segment& seg : segments.conversion_segments()) {
+    key.append(seg.key());
+  }
   // Text before the cursor from the application, when it is available.
-  std::string context(request.context().preceding_text());
+  std::string context =
+      StripComposition(request.context().preceding_text(), key);
   if (context.empty()) {
     // Otherwise, what was committed through Mozc recently.
     for (const Segment& seg : segments.history_segments()) {
@@ -401,6 +490,13 @@ bool NeuralRerankRewriter::Rewrite(const ConversionRequest& request,
   }
   if (request.request_type() != ConversionRequest::CONVERSION ||
       request.incognito_mode()) {
+    return false;
+  }
+  // The predictor runs a conversion on every key stroke to show the top
+  // conversion in the suggestion window. Only rerank on explicit conversion.
+  const ConversionRequest::Options options = request.options();
+  if (options.used_in_predictor_realtime_conversion ||
+      options.skip_slow_rewriters) {
     return false;
   }
 
