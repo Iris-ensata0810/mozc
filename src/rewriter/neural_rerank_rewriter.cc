@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -172,22 +173,6 @@ bool WaitFor(SocketHandle s, bool for_write, int timeout_ms) {
 }
 #endif  // _WIN32
 
-class ScopedSocket {
- public:
-  explicit ScopedSocket(SocketHandle s) : s_(s) {}
-  ~ScopedSocket() {
-    if (s_ != kInvalidSocket) {
-      CloseSocket(s_);
-    }
-  }
-  ScopedSocket(const ScopedSocket&) = delete;
-  ScopedSocket& operator=(const ScopedSocket&) = delete;
-  SocketHandle get() const { return s_; }
-
- private:
-  SocketHandle s_;
-};
-
 #ifdef _WIN32
 constexpr int kSendFlags = 0;
 #elif defined(MSG_NOSIGNAL)
@@ -196,48 +181,60 @@ constexpr int kSendFlags = MSG_NOSIGNAL;
 constexpr int kSendFlags = 0;
 #endif
 
-// Sends |request| and reads one line, all within |deadline_ms| (monotonic).
-std::optional<std::string> Exchange(uint16_t port, const std::string& request,
-                                    int64_t deadline_ms) {
+int RemainingMs(int64_t deadline_ms) {
+  return static_cast<int>(deadline_ms - NowMs());
+}
+
+// Opens a non-blocking TCP connection to 127.0.0.1:|port| with Nagle's
+// algorithm off. Returns kInvalidSocket on failure or timeout.
+SocketHandle Connect(uint16_t port, int64_t deadline_ms) {
   if (!InitSockets()) {
-    return std::nullopt;
+    return kInvalidSocket;
   }
-  ScopedSocket sock(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
-  if (sock.get() == kInvalidSocket || !SetNonBlocking(sock.get())) {
-    return std::nullopt;
+  SocketHandle s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (s == kInvalidSocket) {
+    return kInvalidSocket;
+  }
+  int one = 1;
+  ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one),
+               sizeof(one));
+  if (!SetNonBlocking(s)) {
+    CloseSocket(s);
+    return kInvalidSocket;
   }
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1 only.
-  if (::connect(sock.get(), reinterpret_cast<const sockaddr*>(&addr),
-                sizeof(addr)) != 0) {
-    if (!ConnectInProgress()) {
-      return std::nullopt;
-    }
-    if (!WaitFor(sock.get(), true, static_cast<int>(deadline_ms - NowMs()))) {
-      return std::nullopt;
-    }
+  if (::connect(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) !=
+      0) {
     int err = 0;
     socklen_t len = sizeof(err);
-    if (::getsockopt(sock.get(), SOL_SOCKET, SO_ERROR,
-                     reinterpret_cast<char*>(&err), &len) != 0 ||
+    if (!ConnectInProgress() || !WaitFor(s, true, RemainingMs(deadline_ms)) ||
+        ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err),
+                     &len) != 0 ||
         err != 0) {
-      return std::nullopt;
+      CloseSocket(s);
+      return kInvalidSocket;
     }
   }
+  return s;
+}
 
+// Sends |request| and reads one line on |s|, within |deadline_ms|.
+std::optional<std::string> SendAndReadLine(SocketHandle s,
+                                           const std::string& request,
+                                           int64_t deadline_ms) {
   size_t sent = 0;
   while (sent < request.size()) {
-    const int n = static_cast<int>(::send(sock.get(), request.data() + sent,
-                                          static_cast<int>(request.size() - sent),
-                                          kSendFlags));
+    const int n = static_cast<int>(
+        ::send(s, request.data() + sent,
+               static_cast<int>(request.size() - sent), kSendFlags));
     if (n > 0) {
       sent += static_cast<size_t>(n);
       continue;
     }
-    if (n < 0 && WouldBlock() &&
-        WaitFor(sock.get(), true, static_cast<int>(deadline_ms - NowMs()))) {
+    if (n < 0 && WouldBlock() && WaitFor(s, true, RemainingMs(deadline_ms))) {
       continue;
     }
     return std::nullopt;
@@ -249,10 +246,10 @@ std::optional<std::string> Exchange(uint16_t port, const std::string& request,
     if (response.size() > kMaxResponseBytes) {
       return std::nullopt;
     }
-    if (!WaitFor(sock.get(), false, static_cast<int>(deadline_ms - NowMs()))) {
+    if (!WaitFor(s, false, RemainingMs(deadline_ms))) {
       return std::nullopt;
     }
-    const int n = static_cast<int>(::recv(sock.get(), buf, sizeof(buf), 0));
+    const int n = static_cast<int>(::recv(s, buf, sizeof(buf), 0));
     if (n > 0) {
       response.append(buf, static_cast<size_t>(n));
       continue;
@@ -262,17 +259,65 @@ std::optional<std::string> Exchange(uint16_t port, const std::string& request,
     }
     return std::nullopt;  // closed or error
   }
-  response.resize(response.find('\n'));
+  if (response.find('\n') + 1 != response.size()) {
+    return std::nullopt;  // more than one line: out of sync
+  }
+  response.resize(response.size() - 1);
   return response;
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------- backend
+// One TCP connection kept open across queries, so that each conversion does
+// not pay for a new connection. Closed on any failure (a late answer must not
+// be read as the answer to the next query).
+struct LocalServerRerankBackend::Connection {
+  SocketHandle socket = kInvalidSocket;
+  ~Connection() { Close(); }
+  void Close() {
+    if (socket != kInvalidSocket) {
+      CloseSocket(socket);
+      socket = kInvalidSocket;
+    }
+  }
+};
+
 LocalServerRerankBackend::LocalServerRerankBackend(uint16_t port,
                                                    int timeout_ms,
                                                    int backoff_ms)
-    : port_(port), timeout_ms_(timeout_ms), backoff_ms_(backoff_ms) {}
+    : port_(port),
+      timeout_ms_(timeout_ms),
+      backoff_ms_(backoff_ms),
+      conn_(std::make_unique<Connection>()) {}
+
+LocalServerRerankBackend::~LocalServerRerankBackend() = default;
+
+std::optional<std::string> LocalServerRerankBackend::Exchange(
+    const std::string& request, int64_t deadline_ms) const {
+  // Reuse the open connection. If it fails before anything came back (e.g.
+  // the server was restarted), try once more on a fresh connection.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const bool reused = conn_->socket != kInvalidSocket;
+    if (!reused) {
+      conn_->socket = Connect(port_, deadline_ms);
+      if (conn_->socket == kInvalidSocket) {
+        return std::nullopt;
+      }
+      ++stat_connects_;
+    }
+    std::optional<std::string> line =
+        SendAndReadLine(conn_->socket, request, deadline_ms);
+    if (line.has_value()) {
+      return line;
+    }
+    conn_->Close();
+    if (!reused || RemainingMs(deadline_ms) <= 0) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
 
 std::string LocalServerRerankBackend::BuildRequest(const Query& query) {
   std::string out = "{\"ctx\":";
@@ -294,7 +339,8 @@ std::string LocalServerRerankBackend::BuildRequest(const Query& query) {
     out.append(",\"stat\":{\"n\":" + std::to_string(query.stat_count) +
                ",\"timeouts\":" + std::to_string(query.stat_timeouts) +
                ",\"last_ms\":" + std::to_string(query.stat_last_ms) +
-               ",\"max_ms\":" + std::to_string(query.stat_max_ms) + "}");
+               ",\"max_ms\":" + std::to_string(query.stat_max_ms) +
+               ",\"connects\":" + std::to_string(query.stat_connects) + "}");
   }
   out.append("}\n");
   return out;
@@ -326,6 +372,7 @@ std::optional<std::vector<int>> LocalServerRerankBackend::ParseResponse(
 
 std::optional<std::vector<int>> LocalServerRerankBackend::Rerank(
     const Query& query) const {
+  std::lock_guard<std::mutex> lock(mutex_);
   const int64_t now = NowMs();
   if (now < next_try_ms_) {
     return std::nullopt;  // backing off after a recent failure
@@ -335,8 +382,8 @@ std::optional<std::vector<int>> LocalServerRerankBackend::Rerank(
   q.stat_timeouts = stat_timeouts_;
   q.stat_last_ms = stat_last_ms_;
   q.stat_max_ms = stat_max_ms_;
-  std::optional<std::string> line =
-      Exchange(port_, BuildRequest(q), now + timeout_ms_);
+  q.stat_connects = stat_connects_;
+  std::optional<std::string> line = Exchange(BuildRequest(q), now + timeout_ms_);
   const int elapsed = static_cast<int>(NowMs() - now);
   ++stat_count_;
   stat_last_ms_ = elapsed;

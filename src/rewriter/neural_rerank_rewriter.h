@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@ class RerankBackend {
     int stat_timeouts = 0;
     int stat_last_ms = 0;
     int stat_max_ms = 0;
+    int stat_connects = 0;
   };
 
   virtual ~RerankBackend() = default;
@@ -57,6 +59,7 @@ class RerankBackend {
 class LocalServerRerankBackend : public RerankBackend {
  public:
   LocalServerRerankBackend(uint16_t port, int timeout_ms, int backoff_ms);
+  ~LocalServerRerankBackend() override;
   std::optional<std::vector<int>> Rerank(const Query& query) const override;
 
   // Exposed for tests.
@@ -68,7 +71,14 @@ class LocalServerRerankBackend : public RerankBackend {
   uint16_t port_;
   int timeout_ms_;
   int backoff_ms_;
+  struct Connection;
+  std::optional<std::string> Exchange(const std::string& request,
+                                      int64_t deadline_ms) const;
+
+  mutable std::mutex mutex_;
+  std::unique_ptr<Connection> conn_;
   mutable int64_t next_try_ms_ = 0;  // monotonic ms; 0 = try now
+  mutable int stat_connects_ = 0;
   mutable int stat_count_ = 0;
   mutable int stat_timeouts_ = 0;
   mutable int stat_last_ms_ = 0;
