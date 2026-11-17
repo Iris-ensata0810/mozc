@@ -400,6 +400,28 @@ std::optional<std::vector<int>> LocalServerRerankBackend::Rerank(
   return order;
 }
 
+void LocalServerRerankBackend::ReportCommit(
+    const std::vector<std::pair<std::string, std::string>>& segments) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const int64_t now = NowMs();
+  if (now < next_try_ms_ || segments.empty()) {
+    return;
+  }
+  std::string out = "{\"commit\":[";
+  for (size_t i = 0; i < segments.size(); ++i) {
+    if (i > 0) out.push_back(',');
+    out.append("{\"key\":");
+    AppendJsonString(segments[i].first, &out);
+    out.append(",\"value\":");
+    AppendJsonString(segments[i].second, &out);
+    out.push_back('}');
+  }
+  out.append("]}\n");
+  if (!Exchange(out, now + timeout_ms_).has_value()) {
+    next_try_ms_ = NowMs() + backoff_ms_;
+  }
+}
+
 // ---------------------------------------------------------------- rewriter
 NeuralRerankRewriter::NeuralRerankRewriter()
     : NeuralRerankRewriter(
@@ -594,6 +616,23 @@ bool NeuralRerankRewriter::Rewrite(const ConversionRequest& request,
     }
   }
   return modified;
+}
+
+void NeuralRerankRewriter::Finish(const ConversionRequest& request,
+                                  const Segments& segments) {
+  if (!enabled_ || backend_ == nullptr ||
+      request.request_type() != ConversionRequest::CONVERSION ||
+      request.incognito_mode()) {
+    return;
+  }
+  std::vector<std::pair<std::string, std::string>> committed;
+  for (const Segment& seg : segments.conversion_segments()) {
+    if (seg.candidates_size() == 0) {
+      return;
+    }
+    committed.emplace_back(std::string(seg.key()), seg.candidate(0).value);
+  }
+  backend_->ReportCommit(committed);
 }
 
 }  // namespace mozc

@@ -24,6 +24,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/strings/string_view.h"
@@ -52,6 +53,11 @@ class RerankBackend {
 
   // Returns a permutation of [0, values.size()) or std::nullopt on failure.
   virtual std::optional<std::vector<int>> Rerank(const Query& query) const = 0;
+
+  // Tells which candidates the user finally committed (key, value) per
+  // segment, for tuning. Best effort; the answer is ignored.
+  virtual void ReportCommit(
+      const std::vector<std::pair<std::string, std::string>>& segments) const {}
 };
 
 // Talks to src/rerank_server.py of the IME project over a TCP socket bound to
@@ -61,6 +67,8 @@ class LocalServerRerankBackend : public RerankBackend {
   LocalServerRerankBackend(uint16_t port, int timeout_ms, int backoff_ms);
   ~LocalServerRerankBackend() override;
   std::optional<std::vector<int>> Rerank(const Query& query) const override;
+  void ReportCommit(const std::vector<std::pair<std::string, std::string>>&
+                        segments) const override;
 
   // Exposed for tests.
   static std::string BuildRequest(const Query& query);
@@ -97,6 +105,8 @@ class NeuralRerankRewriter : public RewriterInterface {
   int capability(const ConversionRequest& request) const override;
   bool Rewrite(const ConversionRequest& request,
                Segments* segments) const override;
+  void Finish(const ConversionRequest& request,
+              const Segments& segments) override;
 
   // Exposed for tests: last |max_chars| Unicode characters of |text|.
   static std::string LastChars(absl::string_view text, size_t max_chars);
